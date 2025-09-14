@@ -106,6 +106,241 @@ local orbitspeedslider = Tabs.Extra:CreateSlider("orbitspeed", { Title = "Orbit 
 local itemheightslider = Tabs.Extra:CreateSlider("itemheight", { Title = "Item Height", Min = -3, Max = 10, Rounding = 1, Default = 3 })
 --{END OF TAB ELEMENTS}
 
+-- ================================
+-- TAB: Gold Run (nearest Gold Node)
+-- ================================
+local Players = game:GetService("Players")
+local PFS     = game:GetService("PathfindingService")
+local RS      = game:GetService("RunService")
+local LP      = Players.LocalPlayer
+
+Tabs.GoldRun = Tabs.GoldRun or Window:AddTab({ Title = "Gold Run", Icon = "map" })
+
+-- UI
+local gr_on     = Tabs.GoldRun:CreateToggle("gr_on",   { Title = "Enable", Default = false })
+local gr_loop   = Tabs.GoldRun:CreateToggle("gr_loop", { Title = "Loop", Default = true })
+local gr_show   = Tabs.GoldRun:CreateToggle("gr_show", { Title = "Show dots", Default = true })
+local gr_range  = Tabs.GoldRun:CreateSlider ("gr_rng", { Title = "Scan range (studs)", Min = 200, Max = 4000, Default = 4000 })
+local gr_speed  = Tabs.GoldRun:CreateSlider ("gr_spd", { Title = "Run speed", Min = 12, Max = 40, Default = 22 })
+local gr_tol    = Tabs.GoldRun:CreateSlider ("gr_tol", { Title = "Stop tolerance", Min = 0.4, Max = 1.6, Rounding = 2, Default = 0.9 })
+local gr_plan   = Tabs.GoldRun:CreateSlider ("gr_pln", { Title = "Plan time (sec)", Min = 3, Max = 15, Default = 10 })
+Tabs.GoldRun:CreateButton({ Title = "Plan now",   Callback = function() task.spawn(function() _G_GR_PlanOnly() end) end })
+Tabs.GoldRun:CreateButton({ Title = "Stop & clear", Callback = function() gr_on:SetValue(false); _G_GR_Clear() end })
+
+-- helpers
+local function HRP() local ch = LP.Character return ch and ch:FindFirstChild("HumanoidRootPart") end
+local function HUM() local ch = LP.Character return ch and ch:FindFirstChildOfClass("Humanoid") end
+
+local function isGoldModel(m)
+    return m and m:IsA("Model") and (m.Name == "Gold Node" or m.Name == "GoldNode" or m.Name:lower():find("gold"))
+end
+
+-- дистанция HUD
+local ui = Instance.new("ScreenGui")
+ui.Name = "_GoldRunUI"; ui.IgnoreGuiInset = true; ui.ResetOnSpawn = false
+ui.Parent = LP:WaitForChild("PlayerGui")
+
+local card = Instance.new("Frame", ui)
+card.AnchorPoint = Vector2.new(0.5,1)
+card.Position = UDim2.new(0.5,0,1,-8)
+card.Size = UDim2.fromOffset(260, 40)
+card.BackgroundColor3 = Color3.fromRGB(18,18,22)
+card.BorderSizePixel = 0
+card.Visible = false
+Instance.new("UICorner", card).CornerRadius = UDim.new(0, 10)
+
+local lbl = Instance.new("TextLabel", card)
+lbl.BackgroundTransparency = 1
+lbl.Size = UDim2.fromScale(1,1)
+lbl.Font = Enum.Font.GothamBold
+lbl.TextSize = 14
+lbl.TextColor3 = Color3.fromRGB(235,235,240)
+lbl.Text = "Gold: —"
+
+-- точки маршрута
+local dotsFolder
+local function clearDots()
+    if dotsFolder and dotsFolder.Parent then dotsFolder:Destroy() end
+    dotsFolder = nil
+end
+
+local function putDot(pos)
+    local p = Instance.new("Part")
+    p.Anchored = true
+    p.CanCollide = false
+    p.Material = Enum.Material.Neon
+    p.Color = Color3.fromRGB(255, 206, 74)
+    p.Shape = Enum.PartType.Ball
+    p.Size = Vector3.new(0.4,0.4,0.4)  -- чёткие маленькие точки
+    p.CFrame = CFrame.new(pos)
+    p.Parent = dotsFolder
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.FilterDescendantsInstances = {LP.Character}
+
+local function groundY(x, z, baseY)
+    local originY = (baseY or (HRP() and HRP().Position.Y or 40)) + 50
+    local hit = workspace:Raycast(Vector3.new(x, originY, z), Vector3.new(0, -400, 0), rayParams)
+    return (hit and hit.Position.Y + 0.05) or (baseY or 0)
+end
+
+-- поиск ближайшего Gold Node
+local function nearestGold(maxRange)
+    local r = HRP(); if not r then return nil end
+    local me = r.Position
+    local best, bestD
+    local function scan(folder)
+        if not folder then return end
+        for _,m in ipairs(folder:GetChildren()) do
+            if isGoldModel(m) then
+                local pp = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+                if pp then
+                    local d = (pp.Position - me).Magnitude
+                    if d <= maxRange then
+                        if not best or d < bestD then best, bestD = pp, d end
+                    end
+                end
+            end
+        end
+    end
+    scan(workspace:FindFirstChild("Resources"))
+    scan(workspace)
+    return best, bestD
+end
+
+-- построение пути и рисование точек
+local function buildPath(toPos)
+    local r = HRP(); if not r then return {} end
+    local y = r.Position.Y
+    local path = PFS:CreatePath({AgentRadius=2, AgentHeight=5, AgentCanJump=true})
+    local ok = pcall(function() path:ComputeAsync(r.Position, toPos) end)
+    local pts = {}
+    if ok and path.Status == Enum.PathStatus.Success then
+        for _,w in ipairs(path:GetWaypoints()) do
+            table.insert(pts, Vector3.new(w.Position.X, groundY(w.Position.X, w.Position.Z, y), w.Position.Z))
+        end
+    else
+        -- fallback: прямая
+        table.insert(pts, Vector3.new(r.Position.X, groundY(r.Position.X, r.Position.Z, y), r.Position.Z))
+        table.insert(pts, Vector3.new(toPos.X,      groundY(toPos.X,      toPos.Z,      y), toPos.Z))
+    end
+    -- рисуем точки по шагу
+    clearDots()
+    if not gr_show.Value then return pts end
+    dotsFolder = Instance.new("Folder"); dotsFolder.Name = "_GoldDots"; dotsFolder.Parent = workspace
+
+    local step = 4.0
+    for i=1, #pts-1 do
+        local a, b = pts[i], pts[i+1]
+        local seg = b - a
+        local len = seg.Magnitude
+        local dir = seg.Unit
+        for t=0, len, step do
+            putDot(Vector3.new(a.X, groundY(a.X + dir.X*t, a.Z + dir.Z*t, a.Y), a.Z) + dir * t)
+        end
+    end
+    return pts
+end
+
+-- движение по пути (Humanoid:MoveTo) с анти-залипанием
+local function runPath(points)
+    local h = HUM(); local r = HRP()
+    if not (h and r) then return end
+    card.Visible = true
+    local oldWS = h.WalkSpeed; h.WalkSpeed = gr_speed.Value
+
+    for i=1, #points do
+        if not gr_on.Value then break end
+        local target = points[i]
+        local tol = gr_tol.Value
+        h:MoveTo(Vector3.new(target.X, target.Y, target.Z))
+
+        local t0 = tick()
+        local lastPos = r.Position
+        local movedAt = tick()
+
+        while gr_on.Value do
+            r = HRP(); if not r then break end
+            local planar = Vector3.new(target.X, r.Position.Y, target.Z)
+            local d = (planar - r.Position).Magnitude
+            lbl.Text = string.format("Gold: %dm • step %d/%d", math.floor(((points[#points] - r.Position).Magnitude)), i, #points)
+
+            if d <= tol then break end
+            if (r.Position - lastPos).Magnitude > 0.25 then movedAt = tick(); lastPos = r.Position end
+            if tick() - movedAt > 1.2 then h:MoveTo(Vector3.new(target.X, target.Y, target.Z)); movedAt = tick() end
+            if tick() - t0 > 8 then break end
+            RS.Heartbeat:Wait()
+        end
+    end
+
+    h.WalkSpeed = oldWS
+    card.Visible = false
+end
+
+-- публичные действия
+function _G_GR_Clear()
+    clearDots()
+    card.Visible = false
+end
+
+function _G_GR_PlanOnly()
+    local r = HRP(); if not r then return end
+    local node, dist = nearestGold(gr_range.Value)
+    if not node then
+        lbl.Text = "Gold: not found"
+        card.Visible = true
+        task.delay(1.2, function() card.Visible = false end)
+        return
+    end
+    lbl.Text = string.format("Nearest gold: %dm (planning…)", math.floor(dist))
+    card.Visible = true
+    buildPath(node.Position)
+end
+
+-- главный раннер
+task.spawn(function()
+    while true do
+        if not gr_on.Value then
+            _G_GR_Clear()
+            task.wait(0.2)
+        else
+            local h = HUM(); local r = HRP()
+            if not (h and r) then task.wait(0.2) goto continue end
+
+            local node, dist = nearestGold(gr_range.Value)
+            if not node then
+                lbl.Text = "Gold: not found"
+                card.Visible = true
+                task.wait(1.0)
+                goto continue
+            end
+
+            -- план: рисуем путь и ждём заданное время
+            local pts = buildPath(node.Position)
+            local tLeft = gr_plan.Value
+            while gr_on.Value and tLeft > 0 do
+                r = HRP(); if not r then break end
+                local curD = (node.Position - r.Position).Magnitude
+                lbl.Text = string.format("Gold: %dm • start in %ds", math.floor(curD), math.ceil(tLeft))
+                tLeft -= RS.Heartbeat:Wait()
+            end
+
+            if gr_on.Value then
+                -- бег по точкам
+                runPath(pts)
+                clearDots()
+                -- если не лупаем — выключаемся
+                if not gr_loop.Value then
+                    gr_on:SetValue(false)
+                end
+            end
+        end
+        ::continue::
+    end
+end)
+
 
 -- =========================
 -- TAB: Break (Gold + Ice)
